@@ -1,113 +1,168 @@
 import numpy as np
+import matplotlib.pyplot as plt
 import pandas as pd
+import opfunu
+import random
 import time
-import sys
-import os
 import warnings
-from PSFO import PSFO  # 导入算法类
+import sys
 
-# 忽略数值警告
+# Ignore numerical warnings
 warnings.filterwarnings('ignore')
 
-def get_optimum(year, fid):
-    """Return theoretical optimum for CEC functions."""
-    if year == 2017: return fid * 100.0
-    elif year == 2022:
-        opts = {1: 300, 2: 400, 3: 600, 4: 800, 5: 900, 6: 1800,
-                7: 2000, 8: 2200, 9: 2300, 10: 2400, 11: 2600, 12: 2700}
-        return opts.get(fid, 0)
-    return 0
+# ==========================================
+# 1. PSFO Core Algorithm (v4.0 Final)
+# ==========================================
 
-def run_suite_comprehensive(year, dim, func_indices, repeats=30):
-    POP_SIZE = 50
-    MAX_ITER = 1000
-    BOUNDS = [-100, 100]
-    
-    print(f"\n{'='*80}")
-    print(f"PSFO - CEC {year} | Dim: {dim} | Runs: {repeats}")
-    print(f"{'='*80}")
-    
-    summary_data = [] 
-    detailed_data = [] 
-    
-    # 动态导入 opfunu
-    try:
-        if year == 2017: import opfunu.cec_based.cec2017 as cec_module
-        elif year == 2022: import opfunu.cec_based.cec2022 as cec_module
-    except ImportError:
-        print(f"Error: 'opfunu' module not found. Please install it via pip.")
-        return [], []
+class SearchAgent:
+    """Represents a single candidate solution in the population"""
+    def __init__(self, dim, bounds):
+        self.position = np.random.uniform(bounds[0], bounds[1], dim)
+        self.fitness = float('inf')
+        self.best_position = self.position.copy()
+        self.best_fitness = float('inf')
+        self.past_fitness = []
 
-    for fid in func_indices:
-        # 处理函数名称兼容性
-        func_name = f"F{fid}{year}"
-        if not hasattr(cec_module, func_name):
-            if hasattr(cec_module, f"F{fid}"): func_name = f"F{fid}"
-            else: continue
+class PSFO_v4_Final:
+    def __init__(self, obj_func, dim, bounds, pop_size=50, max_iter=1000):
+        self.obj_func = obj_func
+        self.dim = dim
+        self.bounds = bounds
+        self.pop_size = pop_size
+        self.max_iter = max_iter
+        # Renamed 'pandas' to 'population'
+        self.population = [SearchAgent(dim, bounds) for _ in range(pop_size)]
+        self.global_best_pos = None
+        self.global_best_fit = float('inf')
+        self.history = []
 
-        func_class = getattr(cec_module, func_name)
-        problem = func_class(ndim=dim)
-        theoretical_opt = get_optimum(year, fid)
+    def check_bounds(self, position):
+        """Strict boundary clipping to ensure stability on multimodal functions like F10"""
+        return np.clip(position, self.bounds[0], self.bounds[1])
+
+    def elite_local_search(self, current_iter):
+        """Elite Local Search: Gaussian refinement with non-linear decay"""
+        progress = current_iter / self.max_iter
+        # Quartic decay (power of 4), step size becomes extremely small in later stages
+        decay = (1 - progress) ** 4 
+        scale = (self.bounds[1] - self.bounds[0]) * 0.01 * decay
         
-        errors = []
-        
-        sys.stdout.write(f"Running {func_name}: [")
-        for run_id in range(repeats):
-            # 实例化优化器
-            optimizer = PSFO(problem.evaluate, dim, BOUNDS, POP_SIZE, MAX_ITER)
-            best_val = optimizer.run()
+        # Attempt 3 refinement trials
+        for _ in range(3): 
+            candidate_pos = self.global_best_pos + np.random.normal(0, scale, self.dim)
+            candidate_pos = self.check_bounds(candidate_pos)
+            candidate_fit = self.obj_func(candidate_pos)
             
-            error = best_val - theoretical_opt
-            if abs(error) < 1e-8: error = 0.0
-            errors.append(error)
+            if candidate_fit < self.global_best_fit:
+                self.global_best_fit = candidate_fit
+                self.global_best_pos = candidate_pos
+                # Sync to the first agent to prevent loss of the best solution
+                self.population[0].position = candidate_pos.copy()
+                self.population[0].fitness = candidate_fit
+
+    def run(self):
+        # --- Initialization & Evaluation ---
+        for agent in self.population:
+            fit = self.obj_func(agent.position)
+            agent.fitness = fit
+            agent.best_fitness = fit
+            if fit < self.global_best_fit:
+                self.global_best_fit = fit
+                self.global_best_pos = agent.position.copy()
+        
+        self.history.append(self.global_best_fit)
+
+        # --- Main Iteration Loop ---
+        for t in range(self.max_iter):
+            # 1. Phase Division and Parameter Decay
+            progress = t / self.max_iter
+            if progress < 0.33: 
+                phase = "PHASE_I"
+            elif progress < 0.66: 
+                phase = "PHASE_II"
+            else: 
+                phase = "PHASE_III"
+
+            # Guidance Factor (Cubic decay)
+            alpha = 2.0 * (1 - progress) ** 3
+            # Stochastic Variance (Environmental Noise)
+            sigma = (self.bounds[1] - self.bounds[0]) * 0.02 * (1 - progress)
+
+            for i, agent in enumerate(self.population):
+                curr = agent.position
+                new_pos = curr.copy()
+
+                # --- 2. Multi-phase Strategies ---
+                if phase == "PHASE_I":
+                    # Phase I: Rapid Subspace Reduction (Linear Guidance Strategy)
+                    # Exploration focus
+                    r = np.random.random()
+                    new_pos = curr + r * (self.global_best_pos - curr) * alpha
+                
+                elif phase == "PHASE_II":
+                    # Phase II: Local Stabilization (Triangular Consensus Mechanism)
+                    # Exploitation focus
+                    neighbor_idx = (i + 1) % self.pop_size
+                    neighbor_pos = self.population[neighbor_idx].position
+                    new_pos = (curr + self.global_best_pos + neighbor_pos) / 3.0
+                    # Add decaying Gaussian noise
+                    new_pos += np.random.normal(0, sigma, self.dim)
+
+                elif phase == "PHASE_III":
+                    # Phase III: Diversity Re-injection (Hybrid Mutation Strategy)
+                    # Stagnation Avoidance
+                    if np.random.random() < 0.5:
+                        # Strategy A: Cauchy Perturbation (Targeting multimodal/separable functions)
+                        # Randomly select one dimension for Cauchy jump
+                        dim_idx = np.random.randint(0, self.dim)
+                        bound_width = self.bounds[1] - self.bounds[0]
+                        # Heavy-tailed Cauchy distribution to maintain probability of escaping local optima
+                        cauchy_step = np.random.standard_cauchy() * bound_width * 0.05 * (1-progress)
+                        new_pos = self.global_best_pos.copy()
+                        new_pos[dim_idx] += cauchy_step
+                    else:
+                        # Strategy B: Differential Evolution (Targeting rotated functions e.g., F1)
+                        # Move using population distribution vectors
+                        idxs = [idx for idx in range(self.pop_size) if idx != i]
+                        r1, r2 = np.random.choice(idxs, 2, replace=False)
+                        vec_diff = self.population[r1].position - self.population[r2].position
+                        F = 0.5 # Differential Factor
+                        new_pos = self.global_best_pos + F * vec_diff
+
+                # 3. Boundary Constraint Check
+                new_pos = self.check_bounds(new_pos)
+                new_fit = self.obj_func(new_pos)
+                
+                # --- 4. Adaptive Re-initialization (formerly Fast Digestion) ---
+                improvement = 0
+                if len(agent.past_fitness) > 0:
+                    prev = agent.past_fitness[-1]
+                    if abs(prev) > 1e-15: 
+                        improvement = (prev - new_fit) / abs(prev)
+                
+                # Stagnation Monitor: If stagnated and not the global best
+                if improvement < 1e-8 and new_fit > self.global_best_fit:
+                     # Gaussian Reset: Re-spawn around the global best
+                     reset_sigma = (self.bounds[1] - self.bounds[0]) * 0.05 * (1 - progress)
+                     new_pos = self.global_best_pos + np.random.normal(0, reset_sigma, self.dim)
+                     new_pos = self.check_bounds(new_pos)
+                     new_fit = self.obj_func(new_pos)
+
+                # Update individual status
+                agent.position = new_pos
+                agent.fitness = new_fit
+                agent.past_fitness.append(new_fit)
+
+                if new_fit < agent.best_fitness:
+                    agent.best_fitness = new_fit
+                    agent.best_position = new_pos.copy()
+                
+                if new_fit < self.global_best_fit:
+                    self.global_best_fit = new_fit
+                    self.global_best_pos = new_pos.copy()
             
-            if (run_id+1) % 5 == 0:
-                sys.stdout.write(".")
-                sys.stdout.flush()
-        sys.stdout.write("] Done.\n")
-        
-        # 汇总数据
-        summary_data.append({
-            "Function": func_name,
-            "Best": np.min(errors),
-            "Worst": np.max(errors),
-            "Mean": np.mean(errors),
-            "Std": np.std(errors)
-        })
-        
-        # 详细数据 (用于 Wilcoxon 测试)
-        row_dict = {"Function": func_name}
-        for i, err in enumerate(errors):
-            row_dict[f"Run{i+1}"] = err
-        detailed_data.append(row_dict)
-
-    return summary_data, detailed_data
-
-if __name__ == "__main__":
-    start_time = time.time()
-    REPEATS = 30
-    
-    # 创建结果目录
-    if not os.path.exists("results"):
-        os.makedirs("results")
-
-    # --- 1. CEC 2017 (30维) ---
-    # F2 在 CEC2017 中通常被排除 (不稳定)
-    ids_2017 = [i for i in range(1, 31) if i != 2] 
-    summ_17, raw_17 = run_suite_comprehensive(2017, dim=30, func_indices=ids_2017, repeats=REPEATS)
-    
-    if summ_17:
-        pd.DataFrame(summ_17).to_csv("results/psfo2017_summary.csv", index=False)
-        pd.DataFrame(raw_17).to_csv("results/psfo2017_detailed_runs.csv", index=False)
-
-    # --- 2. CEC 2022 (20维) ---
-    ids_2022 = list(range(1, 13))
-    summ_22, raw_22 = run_suite_comprehensive(2022, dim=20, func_indices=ids_2022, repeats=REPEATS)
-    
-    if summ_22:
-        pd.DataFrame(summ_22).to_csv("results/psfo2022_summary.csv", index=False)
-        pd.DataFrame(raw_22).to_csv("results/psfo2022_detailed_runs.csv", index=False)
-
-    elapsed = time.time() - start_time
-    print(f"\nAll Done! Total Time: {elapsed/60:.2f} minutes.")
-    print("Results saved in 'results/' directory.")
+            # --- 5. Elite Local Search (Always Active) ---
+            self.elite_local_search(t)
+            self.history.append(self.global_best_fit)
+            
+        return self.global_best_fit, self.history
