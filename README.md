@@ -1,5 +1,5 @@
 # PSFO
-# Panda Seasonal Foraging Optimizer (PSFO)
+# Phased Search and Fine-tuning Optimizer (PSFO)
 
 This repository contains the source code for the paper: **"Phased Search and Fine-tuning Optimizer: An Effective Meta-Heuristic for Solving Constrained Engineering Design Problems"**.
 
