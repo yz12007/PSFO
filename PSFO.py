@@ -1,9 +1,17 @@
 import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import opfunu
+import random
+import time
+import warnings
+import sys
 
-class Panda:
-    """
-    Individual agent in the PSFO algorithm.
-    """
+# Ignore numerical warnings
+warnings.filterwarnings('ignore')
+
+class SearchAgent:
+    """Represents a single candidate solution in the population"""
     def __init__(self, dim, bounds):
         self.position = np.random.uniform(bounds[0], bounds[1], dim)
         self.fitness = float('inf')
@@ -11,41 +19,31 @@ class Panda:
         self.best_fitness = float('inf')
         self.past_fitness = []
 
-class PSFO:
-    """
-    Panda Seasonal Foraging Optimizer (PSFO)
-    
-    A bio-inspired meta-heuristic algorithm based on the seasonal behavioral 
-    plasticity of giant pandas.
-    
-    Phases:
-    1. Spring (Linear Guidance): Rapid exploration.
-    2. Autumn (Triangular Consensus): Local stabilization.
-    3. Winter (Hybrid Mutation): Anti-stagnation & diversity injection.
-    + Fast Digestion: Resource recycling for inactive particles.
-    """
+class PSFO_v4_Final:
     def __init__(self, obj_func, dim, bounds, pop_size=50, max_iter=1000):
         self.obj_func = obj_func
         self.dim = dim
         self.bounds = bounds
         self.pop_size = pop_size
         self.max_iter = max_iter
-        self.pandas = [Panda(dim, bounds) for _ in range(pop_size)]
+        # Renamed 'pandas' to 'population'
+        self.population = [SearchAgent(dim, bounds) for _ in range(pop_size)]
         self.global_best_pos = None
         self.global_best_fit = float('inf')
-        
+        self.history = []
+
     def check_bounds(self, position):
+        """Strict boundary clipping to ensure stability on multimodal functions like F10"""
         return np.clip(position, self.bounds[0], self.bounds[1])
 
     def elite_local_search(self, current_iter):
-        """
-        Performs fine-grained local search around the global best 
-        using a quartic decay step size.
-        """
+        """Elite Local Search: Gaussian refinement with non-linear decay"""
         progress = current_iter / self.max_iter
+        # Quartic decay (power of 4), step size becomes extremely small in later stages
         decay = (1 - progress) ** 4 
         scale = (self.bounds[1] - self.bounds[0]) * 0.01 * decay
         
+        # Attempt 3 refinement trials
         for _ in range(3): 
             candidate_pos = self.global_best_pos + np.random.normal(0, scale, self.dim)
             candidate_pos = self.check_bounds(candidate_pos)
@@ -54,99 +52,113 @@ class PSFO:
             if candidate_fit < self.global_best_fit:
                 self.global_best_fit = candidate_fit
                 self.global_best_pos = candidate_pos
-                # Update the leader panda as well
-                self.pandas[0].position = candidate_pos.copy()
-                self.pandas[0].fitness = candidate_fit
+                # Sync to the first agent to prevent loss of the best solution
+                self.population[0].position = candidate_pos.copy()
+                self.population[0].fitness = candidate_fit
 
     def run(self):
-        # Initialization
-        for panda in self.pandas:
-            fit = self.obj_func(panda.position)
-            panda.fitness = fit
-            panda.best_fitness = fit
+        # --- Initialization & Evaluation ---
+        for agent in self.population:
+            fit = self.obj_func(agent.position)
+            agent.fitness = fit
+            agent.best_fitness = fit
             if fit < self.global_best_fit:
                 self.global_best_fit = fit
-                self.global_best_pos = panda.position.copy()
+                self.global_best_pos = agent.position.copy()
+        
+        self.history.append(self.global_best_fit)
 
-        # Main Loop
+        # --- Main Iteration Loop ---
         for t in range(self.max_iter):
+            # 1. Phase Division and Parameter Decay
             progress = t / self.max_iter
-            
-            # Determine Season (Phase)
             if progress < 0.33: 
-                season = "SPRING" # Linear Guidance
+                phase = "PHASE_I"
             elif progress < 0.66: 
-                season = "AUTUMN" # Triangular Consensus
+                phase = "PHASE_II"
             else: 
-                season = "WINTER" # Mutation Strategy
-            
+                phase = "PHASE_III"
+
+            # Guidance Factor (Cubic decay)
             alpha = 2.0 * (1 - progress) ** 3
+            # Stochastic Variance (Environmental Noise)
             sigma = (self.bounds[1] - self.bounds[0]) * 0.02 * (1 - progress)
 
-            for i, panda in enumerate(self.pandas):
-                curr = panda.position
+            for i, agent in enumerate(self.population):
+                curr = agent.position
                 new_pos = curr.copy()
-                
-                # --- Phase Updates ---
-                if season == "SPRING":
+
+                # --- 2. Multi-phase Strategies ---
+                if phase == "PHASE_I":
+                    # Phase I: Rapid Subspace Reduction (Linear Guidance Strategy)
+                    # Exploration focus
                     r = np.random.random()
                     new_pos = curr + r * (self.global_best_pos - curr) * alpha
-                    
-                elif season == "AUTUMN":
+                
+                elif phase == "PHASE_II":
+                    # Phase II: Local Stabilization (Triangular Consensus Mechanism)
+                    # Exploitation focus
                     neighbor_idx = (i + 1) % self.pop_size
-                    neighbor_pos = self.pandas[neighbor_idx].position
+                    neighbor_pos = self.population[neighbor_idx].position
                     new_pos = (curr + self.global_best_pos + neighbor_pos) / 3.0
+                    # Add decaying Gaussian noise
                     new_pos += np.random.normal(0, sigma, self.dim)
-                    
-                elif season == "WINTER":
+
+                elif phase == "PHASE_III":
+                    # Phase III: Diversity Re-injection (Hybrid Mutation Strategy)
+                    # Stagnation Avoidance
                     if np.random.random() < 0.5:
-                        # Strategy A: Cauchy Flight (Long-tail jumps)
+                        # Strategy A: Cauchy Perturbation (Targeting multimodal/separable functions)
+                        # Randomly select one dimension for Cauchy jump
                         dim_idx = np.random.randint(0, self.dim)
                         bound_width = self.bounds[1] - self.bounds[0]
+                        # Heavy-tailed Cauchy distribution to maintain probability of escaping local optima
                         cauchy_step = np.random.standard_cauchy() * bound_width * 0.05 * (1-progress)
                         new_pos = self.global_best_pos.copy()
                         new_pos[dim_idx] += cauchy_step
                     else:
-                        # Strategy B: Differential Evolution (Scramble)
+                        # Strategy B: Differential Evolution (Targeting rotated functions e.g., F1)
+                        # Move using population distribution vectors
                         idxs = [idx for idx in range(self.pop_size) if idx != i]
                         r1, r2 = np.random.choice(idxs, 2, replace=False)
-                        vec_diff = self.pandas[r1].position - self.pandas[r2].position
-                        F = 0.5 
+                        vec_diff = self.population[r1].position - self.population[r2].position
+                        F = 0.5 # Differential Factor
                         new_pos = self.global_best_pos + F * vec_diff
-                
-                # Boundary Check & Evaluation
+
+                # 3. Boundary Constraint Check
                 new_pos = self.check_bounds(new_pos)
                 new_fit = self.obj_func(new_pos)
                 
-                # --- Fast Digestion (Resource Recycling Mechanism) ---
-                # Rationale: Inactive particles are recycled to the promising region 
-                # to increase effective sampling density.
+                # --- 4. Adaptive Re-initialization (formerly Fast Digestion) ---
                 improvement = 0
-                if len(panda.past_fitness) > 0:
-                    prev = panda.past_fitness[-1]
-                    if abs(prev) > 1e-15: improvement = (prev - new_fit) / abs(prev)
+                if len(agent.past_fitness) > 0:
+                    prev = agent.past_fitness[-1]
+                    if abs(prev) > 1e-15: 
+                        improvement = (prev - new_fit) / abs(prev)
                 
+                # Stagnation Monitor: If stagnated and not the global best
                 if improvement < 1e-8 and new_fit > self.global_best_fit:
-                      reset_sigma = (self.bounds[1] - self.bounds[0]) * 0.05 * (1 - progress)
-                      new_pos = self.global_best_pos + np.random.normal(0, reset_sigma, self.dim)
-                      new_pos = self.check_bounds(new_pos)
-                      new_fit = self.obj_func(new_pos)
+                     # Gaussian Reset: Re-spawn around the global best
+                     reset_sigma = (self.bounds[1] - self.bounds[0]) * 0.05 * (1 - progress)
+                     new_pos = self.global_best_pos + np.random.normal(0, reset_sigma, self.dim)
+                     new_pos = self.check_bounds(new_pos)
+                     new_fit = self.obj_func(new_pos)
 
-                # Update Individual
-                panda.position = new_pos
-                panda.fitness = new_fit
-                panda.past_fitness.append(new_fit)
+                # Update individual status
+                agent.position = new_pos
+                agent.fitness = new_fit
+                agent.past_fitness.append(new_fit)
+
+                if new_fit < agent.best_fitness:
+                    agent.best_fitness = new_fit
+                    agent.best_position = new_pos.copy()
                 
-                if new_fit < panda.best_fitness:
-                    panda.best_fitness = new_fit
-                    panda.best_position = new_pos.copy()
-                
-                # Update Global Best
                 if new_fit < self.global_best_fit:
                     self.global_best_fit = new_fit
                     self.global_best_pos = new_pos.copy()
             
-            # Elite Local Search (End of Iteration)
+            # --- 5. Elite Local Search (Always Active) ---
             self.elite_local_search(t)
+            self.history.append(self.global_best_fit)
             
-        return self.global_best_fit
+        return self.global_best_fit, self.history
